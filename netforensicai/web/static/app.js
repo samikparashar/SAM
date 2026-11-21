@@ -1,5 +1,28 @@
 const API = "/api";
 
+function applyTheme(theme) {
+  const value = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = value;
+  document.querySelector('meta[name="color-scheme"]')?.setAttribute("content", value);
+  localStorage.setItem("sam-theme", value);
+  const toggle = document.getElementById("theme-toggle");
+  if (toggle) {
+    toggle.querySelector(".theme-toggle-label").textContent = value === "light" ? "Light" : "Dark";
+    toggle.querySelector(".theme-toggle-icon").textContent = value === "light" ? "☀" : "◐";
+    toggle.setAttribute("aria-label", `Switch to ${value === "light" ? "dark" : "light"} theme`);
+  }
+}
+
+const savedTheme = localStorage.getItem("sam-theme");
+applyTheme(savedTheme || "dark");
+
+window.addEventListener("DOMContentLoaded", () => {
+  applyTheme(localStorage.getItem("sam-theme") || "dark");
+  document.getElementById("theme-toggle")?.addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+  });
+});
+
 let _capturePollTimer = null;
 
 function stopCapturePolling() {
@@ -140,7 +163,7 @@ function focusMain() {
   if (heading) {
     heading.setAttribute("tabindex", "-1");
     heading.focus();
-  } else {
+  } else if (algo === "dfs") {
     app.focus();
   }
 }
@@ -151,7 +174,7 @@ function focusMain() {
 function afterNavigate(moveFocus) {
   const heading = document.querySelector("#app h1");
   const name = heading ? heading.textContent.trim() : "";
-  document.title = name ? `${name} · NetForensicAI` : "NetForensicAI";
+  document.title = name ? `${name} · SAM` : "SAM — Strategic Attack Mapper";
   if (moveFocus) focusMain();
 }
 
@@ -436,7 +459,11 @@ async function renderSettings(app) {
 async function renderCaseTab(app, c, tab, rest) {
   stopCapturePolling(); // leaving (or re-rendering) any tab cancels a live capture-status poll loop
   stopTeamPolling(); // same for a team run; the run itself carries on server-side
+  app.classList.remove("workbench-page");
   if (tab === "story") return renderStory(app, c);
+  if (tab === "workbench") return renderAlgorithmWorkbench(app, c);
+  if (tab === "graph") return renderAttackGraphExplorer(app, c);
+  if (tab === "hypotheses") return renderHypothesisAnalysis(app, c);
   if (tab === "evidence") return renderEvidence(app, c);
   if (tab === "files") return renderFiles(app, c, rest.length ? decodeURIComponent(rest.join("/")) : undefined);
   if (tab === "timeline") return renderTimeline(app, c);
@@ -645,8 +672,8 @@ function renderOnboarding() {
     el("p", {
       class: "onboard-lede",
       text:
-        "Add a packet capture or a log export. NetForensicAI parses it, correlates events across sources, runs its " +
-        "detection rules, and tells you what happened - with every line citing the evidence it rests on.",
+        "Add a packet capture or a log export. SAM parses it, correlates events across sources, runs deterministic " +
+        "analysis, and reconstructs the attack graph - with every result tied to evidence.",
     })
   );
 
@@ -668,10 +695,29 @@ function renderOnboarding() {
   card.appendChild(
     el("div", { class: "onboard-actions" }, [
       cta,
+      el("button", {
+        type: "button",
+        class: "button-link secondary",
+        text: "Load Demo Investigation",
+        onclick: loadDemoInvestigation,
+      }),
       el("span", { class: "dim", text: "Nothing is uploaded anywhere. Files stay on this machine." }),
     ])
   );
   return card;
+}
+
+async function loadDemoInvestigation() {
+  try {
+    const created = await apiPost("/cases", {
+      name: "SAM — Synthetic Attack Reconstruction",
+      investigator: "Demo Analyst",
+      description: "Deterministic demonstration case for the Algorithm Workbench.",
+    });
+    location.hash = `#/case/${created.case_id}/workbench`;
+  } catch (e) {
+    toast(e.message, true);
+  }
 }
 
 function caseRow(c) {
@@ -1078,8 +1124,12 @@ function renderGetStarted(c) {
 async function renderOverview(app, c) {
   // --- header -------------------------------------------------------
   const head = el("div", { class: "case-head" });
+  const demoCase = isSamDemoCase(c);
   head.appendChild(
-    el("div", {}, [el("h1", { text: c.name }), el("div", { class: "subtitle", text: c.description || "No description." })])
+    el("div", {}, [
+      el("h1", { text: demoCase ? "Incident Dashboard" : c.name }),
+      el("div", { class: "subtitle", text: demoCase ? "Synthetic investigation overview and attack progression." : (c.description || "No description.") }),
+    ])
   );
   const actions = el("div", { class: "case-head-actions" });
   const statusSel = el("select", { title: "Case status" });
@@ -1101,6 +1151,11 @@ async function renderOverview(app, c) {
   actions.appendChild(el("button", { class: "danger", text: "Delete case", onclick: () => confirmDelete(c) }));
   head.appendChild(actions);
   app.appendChild(head);
+
+  if (isSamDemoCase(c)) {
+    renderSamDashboard(app, c);
+    return;
+  }
 
   // --- what happened ------------------------------------------------
   //
@@ -1842,9 +1897,465 @@ function confirmDelete(c) {
   input.focus();
 }
 
+function renderSamTimeline(app, c) {
+  app.appendChild(el("h1", { text: "Incident Timeline" }));
+  app.appendChild(el("div", { class: "subtitle", text: "Chronological reconstruction of the deterministic synthetic attack sequence." }));
+  const toolbar = el("div", { class: "sam-toolbar" });
+  const type = el("select");
+  ["All event types", "Network", "Authentication", "Process", "File"].forEach(v => type.appendChild(el("option", { text: v, value: v })));
+  const search = el("input", { type: "search", placeholder: "Search timeline event or entity…" });
+  toolbar.append(search, type);
+  app.appendChild(toolbar);
+  const layout = el("div", { class: "sam-timeline-layout" });
+  const list = el("section", { class: "panel sam-timeline-list" });
+  const detail = el("section", { class: "panel sam-timeline-detail" });
+  layout.append(list, detail);
+  app.appendChild(layout);
+  let selected = SAM_DEMO.timeline[0];
+
+  function drawDetail() {
+    detail.innerHTML = "";
+    detail.appendChild(el("div", { class: "card-head" }, [
+      el("h3", { text: selected.event }),
+      el("span", { class: "badge badge-" + cssClass(selected.severity), text: selected.severity }),
+    ]));
+    detail.appendChild(el("div", { class: "sam-detail-grid" }, [
+      el("div", {}, [el("span", { text: "UTC Time" }), el("b", { class: "mono", text: selected.time })]),
+      el("div", {}, [el("span", { text: "Evidence" }), el("b", { class: "mono", text: selected.evidence })]),
+      el("div", {}, [el("span", { text: "Entity" }), el("b", { class: "mono", text: selected.entity })]),
+      el("div", {}, [el("span", { text: "Event Type" }), el("b", { text: selected.type })]),
+    ]));
+    detail.appendChild(el("h3", { text: "Graph Connections" }));
+    detail.appendChild(el("div", { class: "sam-entity-chips" }, [
+      el("span", { text: selected.entity }),
+      el("a", { href: `#/case/${c.case_id}/graph`, text: "Open in Attack Graph" }),
+    ]));
+  }
+
+  function draw() {
+    list.innerHTML = "";
+    const q = search.value.trim().toLowerCase();
+    const rows = SAM_DEMO.timeline.filter(row =>
+      (type.value === "All event types" || row.type === type.value) &&
+      (!q || [row.event, row.entity, row.evidence].join(" ").toLowerCase().includes(q))
+    );
+    rows.forEach((row, i) => {
+      const item = el("button", { type: "button", class: "sam-timeline-row " + (selected.event === row.event ? "selected" : "") });
+      item.appendChild(el("span", { class: "sam-timeline-dot " + cssClass(row.severity) }));
+      item.appendChild(el("span", { class: "mono sam-timeline-time", text: row.time }));
+      item.appendChild(el("div", {}, [
+        el("b", { text: row.event }),
+        el("small", { text: `${row.entity} · ${row.evidence}` }),
+      ]));
+      item.onclick = () => { selected = row; draw(); drawDetail(); };
+      list.appendChild(item);
+    });
+  }
+  search.addEventListener("input", draw);
+  type.addEventListener("change", draw);
+  draw();
+  drawDetail();
+}
+
+function renderAttackGraphExplorer(app, c) {
+  app.appendChild(el("h1", { text: "Attack Graph Explorer" }));
+  app.appendChild(el("div", { class: "subtitle", text: "Interactive directed graph of the reconstructed incident, relationship evidence and traversal state." }));
+  const layout = el("div", { class: "sam-graph-layout" });
+  const graphPanel = el("section", { class: "panel sam-graph-panel" });
+  graphPanel.appendChild(el("div", { class: "card-head" }, [
+    el("h3", { text: "Directed Attack Graph" }),
+    el("span", { class: "dim", text: "10 nodes · 7 accepted edges" }),
+  ]));
+  const canvas = el("div", { class: "sam-graph-canvas" });
+  graphPanel.appendChild(canvas);
+  const aside = el("aside", { class: "panel sam-graph-detail" });
+  layout.append(graphPanel, aside);
+  app.appendChild(layout);
+
+  const traversalPanel = el("section", { class: "panel sam-traversal" });
+  traversalPanel.appendChild(el("div", { class: "card-head" }, [
+    el("h3", { text: "Graph Traversal" }),
+    el("span", { class: "dim", text: "Start: 185.220.101.42" }),
+  ]));
+  const buttons = el("div", { class: "sam-toolbar" });
+  const bfs = el("button", { class: "secondary", text: "Run BFS" });
+  const dfs = el("button", { class: "secondary", text: "Run DFS" });
+  const out = el("div", { class: "sam-traversal-output" });
+  buttons.append(bfs, dfs);
+  traversalPanel.append(buttons, out);
+  app.appendChild(traversalPanel);
+
+  let selectedEdge = WB_EDGES[0];
+  function adjacency() {
+    const map = {};
+    WB_NODES.forEach(n => map[n.id] = []);
+    WB_EDGES.filter(e => e.accepted).forEach(e => {
+      map[e.source].push(e.target);
+      map[e.target].push(e.source);
+    });
+    return map;
+  }
+  bfs.onclick = () => {
+    const map = adjacency(), queue = ["ip1"], visited = new Set(), order = [];
+    while (queue.length) {
+      const id = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id); order.push(id);
+      map[id].sort().forEach(next => { if (!visited.has(next)) queue.push(next); });
+    }
+    out.innerHTML = `<b>BFS Queue trace</b><div class="mono">Queue exhausted · visited ${order.length} nodes</div><div>${order.map(id => wbNode(id).label).join(" → ")}</div>`;
+  };
+  dfs.onclick = () => {
+    const map = adjacency(), stack = ["ip1"], visited = new Set(), order = [];
+    while (stack.length) {
+      const id = stack.pop();
+      if (visited.has(id)) continue;
+      visited.add(id); order.push(id);
+      map[id].slice().sort().reverse().forEach(next => { if (!visited.has(next)) stack.push(next); });
+    }
+    out.innerHTML = `<b>DFS Stack trace</b><div class="mono">Stack exhausted · visited ${order.length} nodes</div><div>${order.map(id => wbNode(id).label).join(" → ")}</div>`;
+  };
+
+  function drawGraph() {
+    canvas.innerHTML = "";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 875 420");
+    WB_EDGES.filter(e => e.accepted).forEach(edge => {
+      const a = wbNode(edge.source), b = wbNode(edge.target);
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+      line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+      line.setAttribute("class", "wb-edge accepted " + (selectedEdge.id === edge.id ? "selected" : ""));
+      line.onclick = () => { selectedEdge = edge; drawGraph(); drawEdgeDetail(); };
+      svg.appendChild(line);
+    });
+    WB_NODES.forEach(node => {
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("class", "wb-node " + node.type);
+      g.onclick = () => {
+        const edge = WB_EDGES.find(e => e.accepted && (e.source === node.id || e.target === node.id));
+        if (edge) { selectedEdge = edge; drawGraph(); drawEdgeDetail(); }
+      };
+      if (node.type === "host" || node.type === "user") {
+        const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        r.setAttribute("x", node.x - 25); r.setAttribute("y", node.y - 18); r.setAttribute("width", 50); r.setAttribute("height", 36); r.setAttribute("rx", 7);
+        g.appendChild(r);
+      } else if (node.type === "event") {
+        const p = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+        p.setAttribute("points", `${node.x},${node.y-24} ${node.x+24},${node.y} ${node.x},${node.y+24} ${node.x-24},${node.y}`);
+        g.appendChild(p);
+      } else {
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("cx", node.x); circle.setAttribute("cy", node.y); circle.setAttribute("r", 22);
+        g.appendChild(circle);
+      }
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.setAttribute("x", node.x); label.setAttribute("y", node.y + 38); label.setAttribute("text-anchor", "middle");
+      label.textContent = node.label;
+      g.appendChild(label);
+      svg.appendChild(g);
+    });
+    canvas.appendChild(svg);
+  }
+  function drawEdgeDetail() {
+    aside.innerHTML = "";
+    aside.appendChild(el("h3", { text: "Relationship Details" }));
+    aside.appendChild(el("div", { class: "sam-edge-title", text: `${wbNode(selectedEdge.source).label} → ${wbNode(selectedEdge.target).label}` }));
+    aside.appendChild(el("div", { class: "sam-detail-grid" }, [
+      el("div", {}, [el("span", { text: "Score" }), el("b", { text: wbScore(selectedEdge).toFixed(2) })]),
+      el("div", {}, [el("span", { text: "Status" }), el("b", { class: "accepted", text: "Accepted" })]),
+      el("div", {}, [el("span", { text: "Δt" }), el("b", { class: "mono", text: `${selectedEdge.dt}s` })]),
+      el("div", {}, [el("span", { text: "Evidence" }), el("b", { class: "mono", text: selectedEdge.evidence.join(", ") })]),
+    ]));
+    aside.appendChild(el("h3", { text: "Relationship Rule" }));
+    aside.appendChild(el("p", { class: "dim", text: selectedEdge.rule }));
+  }
+  drawGraph();
+  drawEdgeDetail();
+}
+
+function renderHypothesisAnalysis(app, c) {
+  app.appendChild(el("h1", { text: "Hypothesis Analysis" }));
+  app.appendChild(el("div", { class: "subtitle", text: "Competing explanations scored from deterministic evidence and rule-based likelihood ratios." }));
+  const formula = el("section", { class: "panel sam-formula" });
+  formula.appendChild(el("h3", { text: "Bayesian Scoring" }));
+  formula.appendChild(el("div", { class: "wb-formula", text: "P(H|E) = P(H) × ∏ LR(Ei) / [P(H) × ∏ LR(Ei) + P(¬H) × ∏ LR(¬Ei)]" }));
+  formula.appendChild(el("p", { class: "dim", text: "Worked example: prior = 0.35; combined supporting likelihood ratio = 5.8; posterior ≈ 0.86. Scores are demonstration values, not calibrated threat probabilities." }));
+  app.appendChild(formula);
+
+  SAM_DEMO.hypotheses.forEach(h => {
+    const card = el("section", { class: "panel sam-hypothesis-card " + (h.status === "Most supported" ? "supported" : "") });
+    card.appendChild(el("div", { class: "sam-hypothesis-head" }, [
+      el("div", {}, [el("span", { class: "sam-kicker", text: h.status }), el("h2", { text: h.name })]),
+      el("div", { class: "sam-posterior" }, [el("b", { text: h.posterior.toFixed(2) }), el("span", { text: "Posterior" })]),
+    ]));
+    card.appendChild(el("div", { class: "sam-hypothesis-metrics" }, [
+      el("div", {}, [el("span", { text: "Prior" }), el("b", { text: h.prior.toFixed(2) })]),
+      el("div", {}, [el("span", { text: "Likelihood ratio" }), el("b", { class: "mono", text: h.odds })]),
+      el("div", {}, [el("span", { text: "Posterior" }), el("b", { text: h.posterior.toFixed(2) })]),
+    ]));
+    card.appendChild(el("div", { class: "sam-hypothesis-evidence" }, [
+      el("div", {}, [el("b", { text: "Supporting evidence" }), el("p", { class: "mono", text: h.evidence.join(" · ") })]),
+      el("div", {}, [el("b", { text: "Contradicting evidence" }), el("p", { class: "mono", text: h.contradict.join(" · ") })]),
+    ]));
+    app.appendChild(card);
+  });
+}
+
+function renderSamReport(app, c) {
+  app.appendChild(el("h1", { text: "Investigation Report" }));
+  app.appendChild(el("div", { class: "subtitle", text: "Polished deterministic report for the synthetic incident demonstration." }));
+  const actions = el("div", { class: "sam-toolbar" });
+  const printBtn = el("button", { class: "primary", text: "Print / Save PDF" });
+  printBtn.onclick = () => window.print();
+  actions.append(printBtn);
+  app.appendChild(actions);
+
+  const report = el("article", { class: "sam-report" });
+  report.appendChild(el("header", {}, [
+    el("div", {}, [el("span", { class: "sam-kicker", text: "SAM · STRATEGIC ATTACK MAPPER" }), el("h2", { text: "Synthetic Incident Reconstruction" })]),
+    el("div", { class: "sam-report-meta", text: `${c.case_id} · ${SAM_DEMO.window}` }),
+  ]));
+  report.appendChild(el("section", {}, [
+    el("h3", { text: "Incident Summary" }),
+    el("p", { text: `${SAM_DEMO.scenario}. Evidence indicates an external RDP login, account compromise, encoded PowerShell execution, lateral SMB authentication, credential-tool use, sensitive file access and possible HTTPS exfiltration.` }),
+  ]));
+  report.appendChild(el("section", {}, [
+    el("h3", { text: "Attack Sequence" }),
+    el("ol", { class: "sam-report-list" }),
+  ]));
+  const seq = report.querySelector(".sam-report-list");
+  SAM_DEMO.timeline.forEach(row => seq.appendChild(el("li", {}, [el("b", { text: `${row.time} — ${row.event}` }), el("span", { text: ` Evidence ${row.evidence}; entity ${row.entity}.` })])));
+  report.appendChild(el("section", {}, [
+    el("h3", { text: "Graph Findings" }),
+    el("p", { text: "G=(V,E) contains 10 nodes and 7 accepted relationships. The candidate set contains 9 relationships; 7 score at or above 0.50 and 2 are rejected. Density = 0.078." }),
+  ]));
+  report.appendChild(el("section", {}, [
+    el("h3", { text: "Hypothesis Conclusion" }),
+    el("p", { text: "The external intrusion with lateral credential abuse hypothesis has the highest posterior score (0.86). Authorized troubleshooting and red-team explanations receive substantially lower support." }),
+  ]));
+  report.appendChild(el("section", {}, [
+    el("h3", { text: "Affected Entities" }),
+    el("div", { class: "sam-entity-chips" }, [
+      el("span", { text: "j.morgan" }), el("span", { text: "WS-FIN-04" }), el("span", { text: "SRV-DC-01" }),
+      el("span", { text: "powershell.exe" }), el("span", { text: "mimikatz.exe" }), el("span", { text: "payroll.xlsx" }),
+    ]),
+  ]));
+  app.appendChild(report);
+}
+
+function renderSamDashboard(app, c) {
+  app.appendChild(el("div", { class: "sam-demo-banner" }, [
+    el("div", {}, [
+      el("span", { class: "sam-kicker", text: "ACTIVE SYNTHETIC INCIDENT" }),
+      el("h2", { text: SAM_DEMO.scenario }),
+      el("p", { text: `${SAM_DEMO.window} · External RDP → account compromise → PowerShell → lateral movement → sensitive file access` }),
+    ]),
+    el("span", { class: "sam-severity", text: "HIGH SEVERITY" }),
+  ]));
+
+  const live = el("section", { class: "panel sam-live-panel" });
+  live.appendChild(el("div", { class: "sam-live-head" }, [
+    el("div", {}, [
+      el("span", { class: "sam-live-dot" }),
+      el("b", { text: "LIVE SYNTHETIC TELEMETRY" }),
+      el("span", { class: "mono", text: "14:42:00 UTC" }),
+    ]),
+    el("button", { type: "button", class: "secondary sam-live-run", text: "▶ Run 10-second Demo Stream" }),
+  ]));
+  const liveFeed = el("div", { class: "sam-live-feed" });
+  live.appendChild(liveFeed);
+  app.appendChild(live);
+
+  const liveRows = SAM_DEMO.timeline.slice(-6).reverse();
+  function drawLiveFeed() {
+    liveFeed.innerHTML = "";
+    liveRows.forEach(row => liveFeed.appendChild(el("div", { class: "sam-live-row" }, [
+      el("span", { class: "mono", text: row.time }),
+      el("b", { text: row.event }),
+      el("span", { class: "mono", text: row.evidence }),
+      el("span", { class: "badge badge-" + cssClass(row.severity), text: row.severity }),
+    ])));
+  }
+  drawLiveFeed();
+  let streamTimer = null;
+  let streamIndex = 0;
+  live.querySelector(".sam-live-run").onclick = ev => {
+    const button = ev.currentTarget;
+    if (streamTimer) {
+      clearInterval(streamTimer);
+      streamTimer = null;
+      button.textContent = "▶ Replay 10-second Demo Stream";
+      return;
+    }
+    streamIndex = 0;
+    liveFeed.innerHTML = "";
+    button.textContent = "■ Stop Stream";
+    streamTimer = setInterval(() => {
+      const row = SAM_DEMO.timeline[streamIndex % SAM_DEMO.timeline.length];
+      liveFeed.prepend(el("div", { class: "sam-live-row new" }, [
+        el("span", { class: "mono", text: row.time }),
+        el("b", { text: row.event }),
+        el("span", { class: "mono", text: row.evidence }),
+        el("span", { class: "badge badge-" + cssClass(row.severity), text: row.severity }),
+      ]));
+      while (liveFeed.children.length > 6) liveFeed.lastElementChild.remove();
+      streamIndex++;
+      if (streamIndex >= SAM_DEMO.timeline.length) {
+        clearInterval(streamTimer);
+        streamTimer = null;
+        button.textContent = "▶ Replay 10-second Demo Stream";
+      }
+    }, 700);
+  };
+
+  const kpis = el("div", { class: "sam-kpi-grid" });
+  [
+    ["14", "Evidence events", "from 7 telemetry sources"],
+    ["10", "Extracted graph entities", "from 14 normalized events"],
+    ["9", "Candidate relationships", "bounded 300-second window"],
+    ["7", "Accepted edges", "relationship score ≥ 0.50"],
+  ].forEach(([n, label, sub]) => kpis.appendChild(el("div", { class: "sam-kpi" }, [
+    el("b", { text: n }), el("span", { text: label }), el("small", { text: sub }),
+  ])));
+  app.appendChild(kpis);
+
+  const grid = el("div", { class: "sam-dashboard-grid" });
+  const progression = el("section", { class: "panel sam-panel" });
+  progression.appendChild(el("h3", { text: "Attack Progression" }));
+  const track = el("div", { class: "sam-progression" });
+  ["External login", "Account compromise", "PowerShell", "Privilege abuse", "Lateral movement", "File access", "Exfiltration"].forEach((label, i) => {
+    track.appendChild(el("div", { class: "sam-progress-step " + (i < 6 ? "complete" : "possible") }, [
+      el("span", { text: String(i + 1).padStart(2, "0") }),
+      el("b", { text: label }),
+    ]));
+  });
+  progression.appendChild(track);
+  grid.appendChild(progression);
+
+  const quick = el("section", { class: "panel sam-panel" });
+  quick.appendChild(el("h3", { text: "Quick Navigation" }));
+  const links = [
+    ["Evidence Explorer", "evidence", "14 events"],
+    ["Algorithm Workbench", "workbench", "6 stages"],
+    ["Attack Graph", "graph", "10 nodes"],
+    ["Incident Timeline", "timeline", "14 events"],
+    ["Hypotheses", "hypotheses", "3 models"],
+  ];
+  links.forEach(([label, tab, meta]) => {
+    const link = el("a", { class: "sam-quick-link", href: `#/case/${c.case_id}/${tab}` }, [
+      el("b", { text: label }), el("span", { text: meta }),
+    ]);
+    quick.appendChild(link);
+  });
+  grid.appendChild(quick);
+  app.appendChild(grid);
+
+  const recent = el("section", { class: "panel sam-panel" });
+  recent.appendChild(el("div", { class: "card-head" }, [
+    el("h3", { text: "Recent Evidence" }),
+    el("a", { class: "right", href: `#/case/${c.case_id}/evidence`, text: "Open Evidence Explorer" }),
+  ]));
+  const table = el("table");
+  table.innerHTML = "<thead><tr><th>Time</th><th>Event</th><th>Source</th><th>Entity</th><th>Severity</th></tr></thead>";
+  const tbody = el("tbody");
+  SAM_DEMO.timeline.slice().reverse().slice(0, 5).forEach(row => {
+    tbody.appendChild(el("tr", { class: "clickable", onclick: () => location.hash = `#/case/${c.case_id}/timeline` }, [
+      el("td", { class: "mono", text: row.time }),
+      el("td", { text: row.event }),
+      el("td", { text: row.evidence }),
+      el("td", { class: "mono", text: row.entity }),
+      el("td", {}, [el("span", { class: "badge badge-" + cssClass(row.severity), text: row.severity })]),
+    ]));
+  });
+  table.appendChild(tbody);
+  recent.appendChild(table);
+  app.appendChild(recent);
+}
+
+function renderSamEvidence(app, c) {
+  app.appendChild(el("h1", { text: "Evidence Explorer" }));
+  app.appendChild(el("div", { class: "subtitle", text: "Search, filter and inspect the normalized synthetic security log set." }));
+
+  const controls = el("div", { class: "sam-toolbar" });
+  const search = el("input", { type: "search", placeholder: "Search evidence, host, entity or event…" });
+  const source = el("select");
+  ["All sources", "Firewall", "Identity", "Endpoint", "Windows Security", "File", "Proxy", "DNS", "EDR"].forEach(v => source.appendChild(el("option", { text: v, value: v })));
+  const severity = el("select");
+  ["All severities", "High", "Critical", "Medium"].forEach(v => severity.appendChild(el("option", { text: v, value: v })));
+  controls.append(search, source, severity);
+  app.appendChild(controls);
+
+  const layout = el("div", { class: "sam-evidence-layout" });
+  const list = el("section", { class: "panel sam-evidence-list" });
+  list.appendChild(el("h3", { text: "Synthetic Evidence" }));
+  const detail = el("section", { class: "panel sam-evidence-detail" });
+  layout.append(list, detail);
+  app.appendChild(layout);
+
+  let selected = SAM_DEMO.evidence[0];
+
+  function draw() {
+    list.innerHTML = "";
+    list.appendChild(el("h3", { text: "Synthetic Evidence" }));
+    const q = search.value.trim().toLowerCase();
+    const rows = SAM_DEMO.evidence.filter(row =>
+      (source.value === "All sources" || row.source === source.value) &&
+      (severity.value === "All severities" || row.severity.toLowerCase() === severity.value.toLowerCase()) &&
+      (!q || [row.id, row.source, row.event, row.host, row.entity, row.detail].join(" ").toLowerCase().includes(q))
+    );
+    if (!rows.length) {
+      list.appendChild(el("div", { class: "empty", text: "No evidence matches the filters." }));
+      return;
+    }
+    rows.forEach(row => {
+      const item = el("button", { type: "button", class: "sam-evidence-row " + (selected.id === row.id ? "selected" : "") });
+      item.appendChild(el("span", { class: "sam-evidence-id mono", text: row.id }));
+      item.appendChild(el("div", {}, [
+        el("b", { text: row.detail }),
+        el("small", { text: `${row.time.slice(11, 19)} · ${row.source} · ${row.host}` }),
+      ]));
+      item.appendChild(el("span", { class: "badge badge-" + cssClass(row.severity), text: row.severity }));
+      item.onclick = () => { selected = row; draw(); drawDetail(); };
+      list.appendChild(item);
+    });
+  }
+
+  function drawDetail() {
+    detail.innerHTML = "";
+    detail.appendChild(el("div", { class: "card-head" }, [
+      el("h3", { text: `${selected.id} · ${selected.event}` }),
+      el("span", { class: "badge badge-" + cssClass(selected.severity), text: selected.severity }),
+    ]));
+    detail.appendChild(el("div", { class: "sam-detail-grid" }, [
+      el("div", {}, [el("span", { text: "Source" }), el("b", { text: selected.source })]),
+      el("div", {}, [el("span", { text: "Timestamp" }), el("b", { class: "mono", text: selected.time })]),
+      el("div", {}, [el("span", { text: "Host" }), el("b", { class: "mono", text: selected.host })]),
+      el("div", {}, [el("span", { text: "Entity" }), el("b", { class: "mono", text: selected.entity })]),
+    ]));
+    detail.appendChild(el("h3", { text: "Normalized Event" }));
+    detail.appendChild(el("pre", { class: "sam-code", text: selected.normalized }));
+    detail.appendChild(el("h3", { text: "Extracted Entities" }));
+    detail.appendChild(el("div", { class: "sam-entity-chips" }, [
+      el("span", { text: selected.entity }),
+      el("span", { text: selected.host }),
+    ]));
+  }
+
+  search.addEventListener("input", draw);
+  source.addEventListener("change", draw);
+  severity.addEventListener("change", draw);
+  draw();
+  drawDetail();
+}
+
 // --- Evidence ---
 
 async function renderEvidence(app, c) {
+  if (isSamDemoCase(c)) {
+    renderSamEvidence(app, c);
+    return;
+  }
   app.appendChild(el("h1", { text: "Evidence" }));
 
   const uploadBar = el("div", { class: "filter-bar" });
@@ -1957,6 +2468,10 @@ function timelineTime(iso) {
 }
 
 async function renderTimeline(app, c) {
+  if (isSamDemoCase(c)) {
+    renderSamTimeline(app, c);
+    return;
+  }
   await glossary();
   app.appendChild(el("h1", { text: "Timeline" }));
   const fields = ["user", "ip", "hostname", "process", "file", "type", "evidence"];
@@ -3091,6 +3606,10 @@ async function renderAttack(app, c) {
 // --- Reports ---
 
 async function renderReports(app, c) {
+  if (isSamDemoCase(c)) {
+    renderSamReport(app, c);
+    return;
+  }
   app.appendChild(el("h1", { text: "Reports" }));
   const tabs = el("div", { class: "report-tabs" });
   const formats = ["markdown", "json", "html"];
@@ -4286,7 +4805,7 @@ async function renderFiles(app, c, focusPath) {
     add("Web address", src.url || "");
     add("Seen", src.timestamp ? fmtUtc(src.timestamp) : "");
     add("How it was recovered", src.recovered_by === "ftp-command-pairing"
-      ? "Rebuilt by NetForensicAI from the FTP command and its data connection (Wireshark could not export it)"
+      ? "Rebuilt by SAM from the FTP command and its data connection (Wireshark could not export it)"
       : "Exported by Wireshark");
     if (src.stream != null) {
       add("Conversation", el("a", { href: `#/case/${c.case_id}/streams/${src.stream}`, text: `Open the conversation it travelled in` }));
@@ -4578,6 +5097,7 @@ const ICONS = {
   event: '<path d="M3 13h4l3-8 4 16 3-8h4"/>',
   arrow: '<path d="M5 12h13M13 6l6 6-6 6"/>',
   story: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H12v18H6.5A2.5 2.5 0 0 1 4 18.5z"/><path d="M20 5.5A2.5 2.5 0 0 0 17.5 3H12v18h5.5A2.5 2.5 0 0 0 20 18.5z"/>',
+  workbench: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M10 6.5h4M6.5 10v4M10 17.5h4"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   upload: '<path d="M12 15V4M7 9l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
@@ -4597,7 +5117,10 @@ const RAIL = [
   [null, "streams", "Conversations", "streams"],
   [null, "triage", "Triage", "triage"],
   ["Analysis", "timeline", "Timeline", "timeline"],
+  [null, "workbench", "Algorithm Workbench", "workbench"],
+  [null, "graph", "Attack Graph Explorer", "attack"],
   [null, "entities", "Entities", "entities"],
+  [null, "hypotheses", "Hypothesis Analysis", "findings"],
   [null, "detections", "Detections", "detections"],
   [null, "iocs", "Threat intel", "indicators"],
   [null, "attack", "ATT&CK", "attack"],
@@ -4623,6 +5146,566 @@ async function wiresharkStatus() {
     }
   }
   return _wiresharkStatus;
+}
+
+// --- Algorithm Workbench (synthetic, deterministic demo) ---
+
+const SAM_DEMO = {
+  scenario: "Compromised workstation to domain credential abuse",
+  severity: "High",
+  window: "2026-11-21 14:32–14:42 UTC",
+  evidence: [
+    { id: "EV-101", time: "2026-11-21T14:32:10Z", source: "Firewall", type: "network", event: "EVT-2041", host: "EDGE-FW-01", entity: "185.220.101.42", detail: "Allowed inbound RDP connection to WS-FIN-04", severity: "high", normalized: "src_ip=185.220.101.42 dst_ip=10.20.4.18 protocol=RDP action=allow" },
+    { id: "EV-104", time: "2026-11-21T14:32:28Z", source: "Identity", type: "authentication", event: "EVT-2045", host: "WS-FIN-04", entity: "j.morgan", detail: "External login matched the j.morgan account", severity: "high", normalized: "user=j.morgan workstation=WS-FIN-04 logon_type=10 src_ip=185.220.101.42 result=success" },
+    { id: "EV-107", time: "2026-11-21T14:33:12Z", source: "Endpoint", type: "process", event: "EVT-2048", host: "WS-FIN-04", entity: "powershell.exe", detail: "Encoded PowerShell process launched from user session", severity: "high", normalized: "process=powershell.exe parent=explorer.exe user=j.morgan command=IEX(New-Object Net.WebClient)" },
+    { id: "EV-112", time: "2026-11-21T14:34:16Z", source: "Endpoint", type: "process", event: "EVT-2052", host: "WS-FIN-04", entity: "regsvr32.exe", detail: "PowerShell spawned a suspicious signed-binary proxy", severity: "high", normalized: "process=regsvr32.exe parent=powershell.exe host=WS-FIN-04 action=remote-script-load" },
+    { id: "EV-118", time: "2026-11-21T14:35:47Z", source: "Windows Security", type: "authentication", event: "EVT-2059", host: "SRV-DC-01", entity: "j.morgan", detail: "Account used for lateral SMB authentication", severity: "critical", normalized: "user=j.morgan source=WS-FIN-04 destination=SRV-DC-01 service=SMB logon_type=3" },
+    { id: "EV-121", time: "2026-11-21T14:36:24Z", source: "Endpoint", type: "process", event: "EVT-2063", host: "SRV-DC-01", entity: "mimikatz.exe", detail: "Credential dumping utility observed on domain controller", severity: "critical", normalized: "process=mimikatz.exe host=SRV-DC-01 privilege=SeDebugPrivilege action=credential-access" },
+    { id: "EV-126", time: "2026-11-21T14:37:08Z", source: "File", type: "file", event: "EVT-2068", host: "SRV-DC-01", entity: "payroll.xlsx", detail: "Sensitive payroll workbook opened from an elevated session", severity: "high", normalized: "file=payroll.xlsx path=C:\\Finance\\Sensitive\\payroll.xlsx access=read host=SRV-DC-01" },
+    { id: "EV-130", time: "2026-11-21T14:38:02Z", source: "Proxy", type: "network", event: "EVT-2072", host: "SRV-DC-01", entity: "203.0.113.77", detail: "Outbound transfer to an external collection endpoint", severity: "critical", normalized: "src=SRV-DC-01 dst=203.0.113.77 bytes=18432000 protocol=HTTPS action=allow" },
+    { id: "EV-132", time: "2026-11-21T14:38:35Z", source: "DNS", type: "network", event: "EVT-2076", host: "SRV-DC-01", entity: "update-sync.net", detail: "Suspicious domain resolved after data access", severity: "high", normalized: "host=SRV-DC-01 query=update-sync.net answer=203.0.113.77 record=A" },
+    { id: "EV-133", time: "2026-11-21T14:39:10Z", source: "Endpoint", type: "process", event: "EVT-2081", host: "WS-FIN-04", entity: "schtasks.exe", detail: "Persistence task created with encoded command", severity: "critical", normalized: "process=schtasks.exe user=j.morgan action=create task=WindowsUpdateSync trigger=logon" },
+    { id: "EV-134", time: "2026-11-21T14:39:48Z", source: "Firewall", type: "network", event: "EVT-2085", host: "EDGE-FW-01", entity: "10.20.4.18", detail: "Repeated SMB connections from workstation to finance subnet", severity: "high", normalized: "src_ip=10.20.4.18 dst_subnet=10.20.6.0/24 protocol=SMB count=34 action=allow" },
+    { id: "EV-135", time: "2026-11-21T14:40:22Z", source: "Identity", type: "authentication", event: "EVT-2090", host: "AUTH-DC-02", entity: "svc_backup", detail: "Service account authenticated outside its normal schedule", severity: "high", normalized: "user=svc_backup source=SRV-DC-01 logon_type=3 result=success normal_hours=06:00-18:00" },
+    { id: "EV-136", time: "2026-11-21T14:41:12Z", source: "EDR", type: "process", event: "EVT-2094", host: "WS-FIN-04", entity: "rundll32.exe", detail: "Suspicious DLL loading blocked by endpoint response", severity: "medium", normalized: "process=rundll32.exe parent=powershell.exe dll=invoice_update.dll action=block" },
+    { id: "EV-137", time: "2026-11-21T14:42:00Z", source: "Proxy", type: "network", event: "EVT-2098", host: "SRV-DC-01", entity: "203.0.113.77", detail: "Periodic HTTPS beacon pattern detected", severity: "critical", normalized: "dst=203.0.113.77 interval=60s samples=3 protocol=HTTPS action=allow size_avg=2048" },
+  ],
+  timeline: [
+    { time: "14:32:10", event: "External RDP connection", evidence: "EV-101", entity: "185.220.101.42", type: "Network", severity: "High" },
+    { time: "14:32:28", event: "j.morgan account logon", evidence: "EV-104", entity: "j.morgan", type: "Authentication", severity: "High" },
+    { time: "14:33:12", event: "Encoded PowerShell execution", evidence: "EV-107", entity: "powershell.exe", type: "Process", severity: "High" },
+    { time: "14:34:16", event: "Signed-binary proxy invocation", evidence: "EV-112", entity: "regsvr32.exe", type: "Process", severity: "High" },
+    { time: "14:35:47", event: "Lateral SMB authentication", evidence: "EV-118", entity: "SRV-DC-01", type: "Authentication", severity: "Critical" },
+    { time: "14:36:24", event: "Credential dumping observed", evidence: "EV-121", entity: "mimikatz.exe", type: "Process", severity: "Critical" },
+    { time: "14:37:08", event: "Sensitive file accessed", evidence: "EV-126", entity: "payroll.xlsx", type: "File", severity: "High" },
+    { time: "14:38:02", event: "Possible data exfiltration", evidence: "EV-130", entity: "203.0.113.77", type: "Network", severity: "Critical" },
+    { time: "14:38:35", event: "Suspicious DNS resolution", evidence: "EV-132", entity: "update-sync.net", type: "Network", severity: "High" },
+    { time: "14:39:10", event: "Persistence task created", evidence: "EV-133", entity: "schtasks.exe", type: "Process", severity: "Critical" },
+    { time: "14:39:48", event: "Repeated finance-subnet SMB access", evidence: "EV-134", entity: "10.20.4.18", type: "Network", severity: "High" },
+    { time: "14:40:22", event: "Unexpected service-account logon", evidence: "EV-135", entity: "svc_backup", type: "Authentication", severity: "High" },
+    { time: "14:41:12", event: "Suspicious DLL load blocked", evidence: "EV-136", entity: "rundll32.exe", type: "Process", severity: "Medium" },
+    { time: "14:42:00", event: "Periodic HTTPS beacon detected", evidence: "EV-137", entity: "203.0.113.77", type: "Network", severity: "Critical" },
+  ],
+  hypotheses: [
+    { name: "External intrusion with lateral credential abuse", prior: 0.35, posterior: 0.86, odds: "LR 5.8", status: "Most supported", evidence: ["EV-101", "EV-104", "EV-107", "EV-118", "EV-121", "EV-130"], contradict: ["EV-130 payload size is unverified"] },
+    { name: "Authorized administrator troubleshooting", prior: 0.40, posterior: 0.10, odds: "LR 0.15", status: "Contradicted", evidence: ["EV-104 account activity"], contradict: ["EV-107", "EV-112", "EV-121", "EV-130"] },
+    { name: "Automated security test or red-team exercise", prior: 0.25, posterior: 0.04, odds: "LR 0.08", status: "Low support", evidence: ["EV-112 signed-binary behavior"], contradict: ["No approved test window; EV-101 external source"] },
+  ],
+};
+
+function isSamDemoCase(c) {
+  return !!c && (
+    String(c.name || "").includes("SAM") ||
+    String(c.name || "").includes("Synthetic Attack") ||
+    String(c.name || "").includes("CYBERTRACE") ||
+    String(c.description || "").includes("Deterministic demonstration")
+  );
+}
+
+const WB_NODES = [
+  { id: "ip1", label: "185.220.101.42", short: "External IP", type: "ip", x: 70, y: 218 },
+  { id: "user1", label: "j.morgan", short: "User", type: "user", x: 210, y: 112 },
+  { id: "host1", label: "WS-FIN-04", short: "Host", type: "host", x: 365, y: 218 },
+  { id: "proc1", label: "powershell.exe", short: "Process", type: "process", x: 525, y: 112 },
+  { id: "proc2", label: "regsvr32.exe", short: "Process", type: "process", x: 525, y: 324 },
+  { id: "host2", label: "SRV-DC-01", short: "Host", type: "host", x: 680, y: 218 },
+  { id: "proc3", label: "mimikatz.exe", short: "Process", type: "process", x: 805, y: 112 },
+  { id: "file1", label: "payroll.xlsx", short: "File", type: "file", x: 805, y: 324 },
+  { id: "event1", label: "E-2041", short: "Login event", type: "event", x: 210, y: 324 },
+  { id: "event2", label: "E-2048", short: "Process event", type: "event", x: 680, y: 112 },
+];
+
+const WB_EDGES = [
+  { id: "e1", source: "ip1", target: "user1", label: "external login", score: 0.93, accepted: true, evidence: ["EV-101", "EV-104"], rule: "External-to-user login within 300 s", dt: 18, I: 1.00, T: 0.94, A: 1.00, R: 1.00 },
+  { id: "e2", source: "user1", target: "host1", label: "compromised session", score: 0.88, accepted: true, evidence: ["EV-104", "EV-107"], rule: "Account and host co-observed in session", dt: 42, I: 1.00, T: 0.86, A: 0.75, R: 1.00 },
+  { id: "e3", source: "host1", target: "proc1", label: "executed", score: 0.91, accepted: true, evidence: ["EV-107", "EV-112"], rule: "Process launched by host within 300 s", dt: 64, I: 1.00, T: 0.79, A: 1.00, R: 1.00 },
+  { id: "e4", source: "proc1", target: "proc2", label: "invoked", score: 0.82, accepted: true, evidence: ["EV-112", "EV-118"], rule: "Suspicious child-process sequence", dt: 91, I: 1.00, T: 0.70, A: 0.75, R: 1.00 },
+  { id: "e5", source: "proc2", target: "host2", label: "lateral movement", score: 0.86, accepted: true, evidence: ["EV-118", "EV-121"], rule: "Host pivot in temporal window", dt: 73, I: 1.00, T: 0.76, A: 0.90, R: 1.00 },
+  { id: "e6", source: "host2", target: "proc3", label: "credential tool", score: 0.79, accepted: true, evidence: ["EV-121", "EV-126"], rule: "Privileged process attributed to host", dt: 108, I: 1.00, T: 0.64, A: 0.85, R: 1.00 },
+  { id: "e7", source: "host2", target: "file1", label: "sensitive access", score: 0.84, accepted: true, evidence: ["EV-121", "EV-130"], rule: "Sensitive file access after privilege change", dt: 96, I: 1.00, T: 0.68, A: 0.95, R: 1.00 },
+  { id: "e8", source: "ip1", target: "host1", label: "network session", score: 0.46, accepted: false, evidence: ["EV-101", "EV-107"], rule: "Network event co-occurrence", dt: 244, I: 0.00, T: 0.19, A: 0.75, R: 0.25 },
+  { id: "e9", source: "proc1", target: "file1", label: "unresolved access", score: 0.41, accepted: false, evidence: ["EV-112"], rule: "Temporal-only file association", dt: 278, I: 0.00, T: 0.07, A: 0.50, R: 0.25 },
+];
+
+const WB_STAGES = [
+  { name: "Event Processing", short: "Normalize", detail: "Normalize timestamps and field names across the synthetic evidence stream." },
+  { name: "Entity Extraction", short: "Extract", detail: "Extract users, hosts, IP addresses, processes, files and event entities." },
+  { name: "Relationship Mapping", short: "Candidates", detail: "Generate bounded candidate relationships from entities and shared events." },
+  { name: "Temporal Validation", short: "Time window", detail: "Validate each candidate against the 300-second temporal window." },
+  { name: "Relationship Scoring", short: "Score", detail: "Calculate I, T, A and R components and apply the configured threshold." },
+  { name: "Graph Construction", short: "Final graph", detail: "Accept relationships at or above 0.50 and construct the final attack graph." },
+];
+
+const WB_STEPS = [
+  "Event normalization",
+  "Entity extraction",
+  "Duplicate entity handling",
+  "Candidate edge generation",
+  "Relationship validation",
+  "Temporal filtering",
+  "Relationship scoring",
+  "Edge acceptance/rejection",
+  "Final graph construction",
+];
+
+function wbNode(id) { return WB_NODES.find(n => n.id === id); }
+
+function wbScore(edge) {
+  return 0.40 * edge.I + 0.25 * edge.T + 0.20 * edge.A + 0.15 * edge.R;
+}
+
+function wbGraphMetrics() {
+  const v = WB_NODES.length;
+  const e = WB_EDGES.filter(x => x.accepted).length;
+  return { vertices: v, edges: e, indegree: 2, outdegree: 3, components: 1, density: (e / (v * (v - 1))).toFixed(3) };
+}
+
+function renderAlgorithmWorkbench(app, c) {
+  app.innerHTML = "";
+  app.classList.add("workbench-page");
+
+  const head = el("div", { class: "wb-header" });
+  head.appendChild(el("div", {}, [
+    el("div", { class: "wb-eyebrow", text: "SAM / ALGORITHM WORKBENCH" }),
+    el("h1", { text: "Attack Graph Construction" }),
+  ]));
+  head.appendChild(el("div", { class: "wb-header-actions" }, [
+    el("button", { type: "button", class: "wb-demo-load", text: "Reload Synthetic Demo" }),
+    el("span", { class: "wb-status", text: "DEMO DATASET READY" }),
+  ]));
+  app.appendChild(head);
+
+  const demoBrief = el("section", { class: "wb-demo-brief", "aria-label": "Synthetic investigation summary" });
+  demoBrief.innerHTML = `
+    <div class="wb-brief-primary">
+      <span class="wb-severity">HIGH CONFIDENCE</span>
+      <div>
+        <b>Compromised workstation → domain credential abuse</b>
+        <p>185.220.101.42 · j.morgan · WS-FIN-04 · 14:32–14:38 UTC</p>
+      </div>
+    </div>
+    <div class="wb-brief-metrics">
+      <div><span>Nodes</span><b>10</b></div>
+      <div><span>Candidates</span><b>9</b></div>
+      <div><span>Accepted</span><b class="accepted">7</b></div>
+      <div><span>Rejected</span><b class="rejected">2</b></div>
+    </div>
+  `;
+  app.appendChild(demoBrief);
+
+  let stage = 0;
+  let algStep = 0;
+  let selectedEdge = WB_EDGES[0];
+  let selectedNode = null;
+  let wbTab = "construction";
+  let traversal = null;
+
+  const pipeline = el("section", { class: "wb-pipeline", "aria-label": "Algorithm execution stages" });
+  const pipelineButtons = [];
+  for (let i = 0; i < WB_STAGES.length; i++) {
+    const btn = el("button", { type: "button", class: "wb-stage", "data-stage": String(i) });
+    btn.appendChild(el("span", { class: "wb-stage-index", text: String(i + 1).padStart(2, "0") }));
+    btn.appendChild(el("span", { class: "wb-stage-text", text: WB_STAGES[i].name }));
+    btn.onclick = () => setStage(i);
+    pipelineButtons.push(btn);
+    pipeline.appendChild(btn);
+  }
+  app.appendChild(pipeline);
+
+  const tabs = el("div", { class: "wb-tabs" });
+  const constructionTab = el("button", { type: "button", class: "wb-tab active", text: "Graph Construction" });
+  const explorationTab = el("button", { type: "button", class: "wb-tab", text: "Graph Exploration" });
+  tabs.append(constructionTab, explorationTab);
+  app.appendChild(tabs);
+
+  const construction = el("div", { class: "wb-construction" });
+  const exploration = el("div", { class: "wb-exploration", hidden: true });
+
+  construction.innerHTML = `
+    <div class="wb-left">
+      <section class="wb-panel wb-overview">
+        <div class="wb-panel-title"><span>Execution Overview</span><b id="wb-stage-label">Stage 1 / 6</b></div>
+        <p id="wb-stage-detail"></p>
+      </section>
+      <section class="wb-panel wb-steps">
+        <div class="wb-panel-title"><span>Algorithm Execution</span><b id="wb-step-count">1 / 9</b></div>
+        <div id="wb-step-list"></div>
+      </section>
+    </div>
+    <section class="wb-center wb-panel">
+      <div class="wb-panel-title"><span>Graph Construction</span><b id="wb-graph-view-label">Initial Entities</b></div>
+      <div id="wb-graph"></div>
+      <div class="wb-graph-flow"><span data-flow="0">Initial Entities</span><i>→</i><span data-flow="1">Candidate Edges</span><i>→</i><span data-flow="2">Filtered Relationships</span><i>→</i><span data-flow="3">Final Attack Graph</span></div>
+      <div class="wb-legend">
+        <span class="ip">IP Address</span><span class="user">User</span><span class="host">Host</span><span class="process">Process</span><span class="file">File</span><span class="event">Event</span>
+      </div>
+    </section>
+    <aside class="wb-right">
+      <section class="wb-panel wb-stat-panel">
+        <div class="wb-panel-title"><span>Graph Statistics</span></div>
+        <div id="wb-stats"></div>
+      </section>
+      <section class="wb-panel wb-count-panel">
+        <div class="wb-panel-title"><span>Intermediate Counts</span></div>
+        <div id="wb-counts"></div>
+      </section>
+    </aside>
+  `;
+  app.appendChild(construction);
+
+  const math = el("section", { class: "wb-panel wb-math" });
+  math.innerHTML = `
+    <div class="wb-panel-title"><span>Mathematical Explanation</span><b id="wb-edge-name"></b></div>
+    <div class="wb-math-grid">
+      <div><h3>Graph Representation</h3><div class="wb-formula">G = (V, E)</div><p id="wb-graph-repr"></p></div>
+      <div><h3>Relationship Scoring</h3><div class="wb-formula">S(u,v) = 0.40I + 0.25T + 0.20A + 0.15R</div><p id="wb-score-work"></p></div>
+      <div><h3>Temporal Constraint</h3><div class="wb-formula" id="wb-temporal"></div><p id="wb-temporal-result"></p></div>
+    </div>
+  `;
+  construction.appendChild(math);
+
+  const tablePanel = el("section", { class: "wb-panel wb-table-panel" });
+  tablePanel.innerHTML = `
+    <div class="wb-panel-title"><span>Intermediate Relationship Results</span><b>9 candidates</b></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Source</th><th>Target</th><th>Relationship</th><th>Score</th><th>Status</th></tr></thead>
+      <tbody id="wb-candidate-table"></tbody>
+    </table></div>
+    <div id="wb-edge-detail" class="wb-edge-detail"></div>
+  `;
+  construction.appendChild(tablePanel);
+
+  exploration.innerHTML = `
+    <section class="wb-panel wb-traversal-controls">
+      <div class="wb-panel-title"><span>Graph Algorithm Explorer</span><b>Deterministic traversal</b></div>
+      <div class="wb-algo-buttons">
+        <button type="button" class="btn" data-algo="bfs">Run BFS</button>
+        <button type="button" class="btn" data-algo="dfs">Run DFS</button>
+        <button type="button" class="btn" data-algo="dijkstra">Run Dijkstra</button>
+      </div>
+      <p class="muted">BFS and DFS run on the same final graph. Start: External IP (185.220.101.42).</p>
+      <div id="wb-traversal-output"></div>
+    </section>
+  `;
+  app.appendChild(exploration);
+
+  const insight = el("section", { class: "wb-panel wb-insights" });
+  insight.innerHTML = `<div class="wb-panel-title"><span>Algorithm Insights</span></div><div class="wb-insight-grid">
+    <div><b>Identity evidence</b><p>Shared account, host and process identifiers increase the relationship score.</p></div>
+    <div><b>Temporal ordering</b><p>The candidate window is 300 seconds; events outside the window are rejected.</p></div>
+    <div><b>Evidence confidence</b><p>This score is a transparent demo ranking, not a calibrated probability or proof of causation.</p></div>
+  </div>`;
+  construction.appendChild(insight);
+
+  const controls = el("div", { class: "wb-controls" });
+  const runBtn = el("button", { type: "button", class: "btn primary", text: "Run Complete Analysis" });
+  const demoBtn = el("button", { type: "button", class: "btn wb-demo-autoplay", text: "▶ Auto Demo" });
+  const prevBtn = el("button", { type: "button", class: "btn", text: "← Previous Step" });
+  const nextBtn = el("button", { type: "button", class: "btn", text: "Next Step →" });
+  const resetBtn = el("button", { type: "button", class: "btn danger", text: "Reset" });
+  controls.append(demoBtn, runBtn, prevBtn, nextBtn, resetBtn);
+  app.appendChild(controls);
+
+  function setStage(next) {
+    stage = Math.max(0, Math.min(WB_STAGES.length - 1, next));
+    const stepMap = [0, 1, 3, 5, 6, 8];
+    algStep = stepMap[stage];
+    selectedEdge = stage >= 4 ? WB_EDGES[0] : WB_EDGES[stage < 2 ? 7 : 0];
+    render();
+  }
+
+  function render() {
+    pipelineButtons.forEach((btn, i) => {
+      btn.className = "wb-stage " + (i < stage ? "complete" : i === stage ? "active" : "pending");
+      btn.setAttribute("aria-current", i === stage ? "step" : "false");
+    });
+    document.getElementById("wb-stage-label").textContent = `Stage ${stage + 1} / 6`;
+    document.getElementById("wb-stage-detail").textContent = WB_STAGES[stage].detail;
+
+    const stepList = document.getElementById("wb-step-list");
+    stepList.innerHTML = "";
+    WB_STEPS.forEach((text, i) => {
+      const item = el("button", { type: "button", class: "wb-step " + (i < algStep ? "complete" : i === algStep ? "active" : "pending"), text });
+      item.prepend(el("span", { class: "wb-step-dot", text: i < algStep ? "✓" : String(i + 1).padStart(2, "0") }));
+      item.onclick = () => { algStep = i; stage = i <= 1 ? i : i <= 3 ? 2 : i <= 5 ? 3 : i === 6 ? 4 : 5; render(); };
+      stepList.appendChild(item);
+    });
+    document.getElementById("wb-step-count").textContent = `${algStep + 1} / 9`;
+
+    const graphLabels = ["Initial Entities", "Candidate Edges", "Candidate Edges", "Filtered Relationships", "Relationship Scores", "Final Attack Graph"];
+    document.getElementById("wb-graph-view-label").textContent = graphLabels[stage];
+    const flowIndex = stage === 0 ? 0 : stage <= 2 ? 1 : stage === 3 ? 2 : 3;
+    document.querySelectorAll(".wb-graph-flow [data-flow]").forEach((item, i) => {
+      item.classList.toggle("active", i === flowIndex);
+      item.classList.toggle("complete", i < flowIndex);
+    });
+    renderGraph(stage, selectedNode, selectedEdge);
+
+    const metrics = wbGraphMetrics();
+    document.getElementById("wb-stats").innerHTML = `
+      <div class="wb-stat"><b>${metrics.vertices}</b><span>Nodes</span></div>
+      <div class="wb-stat"><b>${metrics.edges}</b><span>Edges</span></div>
+      <div class="wb-stat"><b>${metrics.indegree}</b><span>Max in-degree</span></div>
+      <div class="wb-stat"><b>${metrics.outdegree}</b><span>Max out-degree</span></div>
+      <div class="wb-stat"><b>${metrics.components}</b><span>Components</span></div>
+      <div class="wb-stat"><b>${metrics.density}</b><span>Density</span></div>`;
+    document.getElementById("wb-counts").innerHTML = `
+      <div class="wb-count-row"><span>Entities</span><b>10</b></div>
+      <div class="wb-count-row"><span>Candidate relationships</span><b>9</b></div>
+      <div class="wb-count-row accepted"><span>Accepted edges</span><b>7</b></div>
+      <div class="wb-count-row rejected"><span>Rejected edges</span><b>2</b></div>`;
+    renderMath(selectedEdge, metrics);
+    renderCandidateTable();
+  }
+
+  function renderGraph(currentStage, nodeSelection, edgeSelection) {
+    const host = document.getElementById("wb-graph");
+    host.innerHTML = "";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 875 420");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Interactive attack graph construction visualization");
+
+    const visibleNodes = currentStage === 0 ? WB_NODES : WB_NODES;
+    const showCandidates = currentStage >= 2;
+    const showAccepted = currentStage >= 3;
+    const showRejected = currentStage === 4;
+    WB_EDGES.forEach(edge => {
+      if (currentStage < 2) return;
+      if (currentStage === 2) { /* show all candidates */ }
+      if (currentStage >= 4 && !edge.accepted) return;
+      const a = wbNode(edge.source), b = wbNode(edge.target);
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+      line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+      line.setAttribute("class", "wb-edge " + (edge.accepted ? "accepted" : "rejected") + (edgeSelection && edgeSelection.id === edge.id ? " selected" : ""));
+      line.setAttribute("data-edge", edge.id);
+      line.onclick = () => { selectedEdge = edge; selectedNode = null; render(); };
+      svg.appendChild(line);
+    });
+
+    if (currentStage < 2) {
+      // Entity-only stage: no candidate edges.
+    }
+    visibleNodes.forEach(node => {
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("class", "wb-node " + node.type + (nodeSelection && nodeSelection.id === node.id ? " selected" : ""));
+      g.setAttribute("role", "button");
+      g.setAttribute("tabindex", "0");
+      g.onclick = () => { selectedNode = node; selectedEdge = WB_EDGES.find(e => e.source === node.id || e.target === node.id) || null; render(); };
+      g.onkeydown = ev => { if (ev.key === "Enter" || ev.key === " ") g.onclick(); };
+      let shape;
+      if (node.type === "user") shape = "rect";
+      else if (node.type === "host") shape = "rect";
+      else if (node.type === "event") shape = "polygon";
+      else shape = "circle";
+      if (shape === "circle") {
+        const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        c.setAttribute("cx", node.x); c.setAttribute("cy", node.y); c.setAttribute("r", 22);
+        g.appendChild(c);
+      } else if (shape === "polygon") {
+        const p = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+        p.setAttribute("points", `${node.x},${node.y-24} ${node.x+24},${node.y} ${node.x},${node.y+24} ${node.x-24},${node.y}`);
+        g.appendChild(p);
+      } else {
+        const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        r.setAttribute("x", node.x - 25); r.setAttribute("y", node.y - 18);
+        r.setAttribute("width", 50); r.setAttribute("height", 36); r.setAttribute("rx", node.type === "host" ? 7 : 4);
+        g.appendChild(r);
+      }
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.setAttribute("x", node.x); label.setAttribute("y", node.y + 38);
+      label.setAttribute("text-anchor", "middle");
+      label.textContent = node.label;
+      g.appendChild(label);
+      svg.appendChild(g);
+    });
+    host.appendChild(svg);
+  }
+
+  function renderMath(edge, metrics) {
+    document.getElementById("wb-edge-name").textContent = edge ? `${edge.source} → ${edge.target}` : "No edge selected";
+    document.getElementById("wb-graph-repr").textContent =
+      `V = ${metrics.vertices} entity/event nodes; E = ${metrics.edges} accepted relationships.`;
+    if (edge) {
+      const score = wbScore(edge);
+      const weighted = `(0.40×${edge.I.toFixed(2)}) + (0.25×${edge.T.toFixed(2)}) + (0.20×${edge.A.toFixed(2)}) + (0.15×${edge.R.toFixed(2)}) = ${score.toFixed(2)}`;
+      document.getElementById("wb-score-work").innerHTML =
+        `<span class="wb-component">I=${edge.I.toFixed(2)}</span> <span class="wb-component">T=${edge.T.toFixed(2)}</span> <span class="wb-component">A=${edge.A.toFixed(2)}</span> <span class="wb-component">R=${edge.R.toFixed(2)}</span><br>${weighted}<br><b class="${edge.accepted ? "accepted" : "rejected"}">${edge.accepted ? "ACCEPTED" : "REJECTED"} ≥ 0.50</b>`;
+      document.getElementById("wb-temporal").textContent = `Δt = ${edge.dt}s  ≤  300s`;
+      document.getElementById("wb-temporal-result").textContent =
+        edge.dt <= 300 ? "Temporal constraint satisfied." : "Temporal constraint failed.";
+    }
+  }
+
+  function renderCandidateTable() {
+    const table = document.getElementById("wb-candidate-table");
+    table.innerHTML = "";
+    WB_EDGES.forEach(edge => {
+      const tr = el("tr", { class: "clickable " + (selectedEdge && selectedEdge.id === edge.id ? "selected" : "") });
+      tr.appendChild(el("td", { text: wbNode(edge.source).short + ": " + wbNode(edge.source).label }));
+      tr.appendChild(el("td", { text: wbNode(edge.target).short + ": " + wbNode(edge.target).label }));
+      tr.appendChild(el("td", { text: edge.label }));
+      tr.appendChild(el("td", { text: wbScore(edge).toFixed(2) }));
+      tr.appendChild(el("td", {}, [el("span", { class: "wb-status " + (edge.accepted ? "accepted" : "rejected"), text: edge.accepted ? "Accepted" : "Rejected" })]));
+      tr.onclick = () => { selectedEdge = edge; selectedNode = null; render(); };
+      table.appendChild(tr);
+    });
+    const detail = document.getElementById("wb-edge-detail");
+    if (selectedEdge) {
+      detail.innerHTML = `<b>${selectedEdge.source} → ${selectedEdge.target}</b>
+        <span><b>Evidence:</b> ${selectedEdge.evidence.join(", ")}</span>
+        <span><b>Rule:</b> ${selectedEdge.rule}</span>
+        <span><b>Decision:</b> ${selectedEdge.accepted ? "Accepted" : "Rejected"} because ${selectedEdge.accepted ? "score meets" : "score falls below"} the 0.50 threshold.</span>`;
+    }
+  }
+
+  runBtn.onclick = () => { stage = 5; algStep = 8; selectedEdge = WB_EDGES[0]; render(); };
+  let autoTimer = null;
+  demoBtn.onclick = () => {
+    if (autoTimer) {
+      clearInterval(autoTimer);
+      autoTimer = null;
+      demoBtn.textContent = "▶ Auto Demo";
+      return;
+    }
+    stage = 0;
+    algStep = 0;
+    render();
+    demoBtn.textContent = "■ Stop Demo";
+    autoTimer = setInterval(() => {
+      if (stage >= 5) {
+        clearInterval(autoTimer);
+        autoTimer = null;
+        demoBtn.textContent = "▶ Replay Demo";
+        return;
+      }
+      setStage(stage + 1);
+    }, 950);
+  };
+  prevBtn.onclick = () => { algStep = Math.max(0, algStep - 1); setStage(Math.max(0, stage - 1)); };
+  nextBtn.onclick = () => { if (stage < 5) setStage(stage + 1); else algStep = Math.min(8, algStep + 1); render(); };
+  resetBtn.onclick = () => { stage = 0; algStep = 0; selectedEdge = WB_EDGES[0]; selectedNode = null; render(); };
+  head.querySelector(".wb-demo-load").onclick = () => {
+    if (autoTimer) {
+      clearInterval(autoTimer);
+      autoTimer = null;
+      demoBtn.textContent = "▶ Auto Demo";
+    }
+    stage = 0;
+    algStep = 0;
+    selectedEdge = WB_EDGES[0];
+    selectedNode = null;
+    render();
+    toast("Synthetic investigation reset");
+  };
+
+  constructionTab.onclick = () => {
+    wbTab = "construction"; construction.hidden = false; exploration.hidden = true;
+    constructionTab.classList.add("active"); explorationTab.classList.remove("active");
+  };
+  explorationTab.onclick = () => {
+    wbTab = "explore"; construction.hidden = true; exploration.hidden = false;
+    explorationTab.classList.add("active"); constructionTab.classList.remove("active");
+  };
+
+  exploration.querySelector("[data-algo='bfs']").onclick = () => runTraversal("bfs");
+  exploration.querySelector("[data-algo='dfs']").onclick = () => runTraversal("dfs");
+  exploration.querySelector("[data-algo='dijkstra']").onclick = () => runTraversal("dijkstra");
+
+  function runTraversal(algo) {
+    const start = "ip1";
+    const target = "file1";
+    const adjacency = {};
+    WB_NODES.forEach(n => adjacency[n.id] = []);
+    WB_EDGES.filter(e => e.accepted).forEach(e => {
+      adjacency[e.source].push(e.target);
+      adjacency[e.target].push(e.source);
+    });
+    const visited = new Set();
+    const order = [];
+    if (algo === "bfs") {
+      const queue = [start];
+      while (queue.length) {
+        const id = queue.shift();
+        if (visited.has(id)) continue;
+        visited.add(id); order.push(id);
+        adjacency[id].sort().forEach(next => { if (!visited.has(next)) queue.push(next); });
+      }
+      traversal = { name: "Breadth-First Search", structure: "Queue", state: queue, visited, order };
+    } else if (algo === "dfs") {
+      const stack = [start];
+      while (stack.length) {
+        const id = stack.pop();
+        if (visited.has(id)) continue;
+        visited.add(id); order.push(id);
+        const neighbors = adjacency[id].slice().sort().reverse();
+        neighbors.forEach(next => { if (!visited.has(next)) stack.push(next); });
+      }
+      traversal = { name: "Depth-First Search", structure: "Stack", state: stack, visited, order };
+    } else {
+      const weighted = {};
+      WB_NODES.forEach(n => weighted[n.id] = []);
+      WB_EDGES.filter(e => e.accepted).forEach(e => {
+        const cost = 1 - wbScore(e) + 0.001;
+        weighted[e.source].push({ id: e.target, cost });
+        weighted[e.target].push({ id: e.source, cost });
+      });
+      const distances = Object.fromEntries(WB_NODES.map(n => [n.id, Infinity]));
+      const previous = {};
+      const explored = [];
+      const remaining = new Set([start]);
+      distances[start] = 0;
+      while (remaining.size) {
+        let id = null;
+        for (const candidate of remaining) {
+          if (id === null || distances[candidate] < distances[id]) id = candidate;
+        }
+        remaining.delete(id);
+        explored.push(id);
+        if (id === target) break;
+        weighted[id].forEach(next => {
+          const candidateDistance = distances[id] + next.cost;
+          if (candidateDistance < distances[next.id]) {
+            distances[next.id] = candidateDistance;
+            previous[next.id] = id;
+            remaining.add(next.id);
+          }
+        });
+      }
+      const path = [];
+      let cursor = target;
+      while (cursor) {
+        path.unshift(cursor);
+        if (cursor === start) break;
+        cursor = previous[cursor];
+      }
+      traversal = {
+        name: "Dijkstra",
+        structure: "Priority queue",
+        state: Array.from(remaining),
+        visited: new Set(explored),
+        order: explored,
+        path,
+        target,
+      };
+    }
+    const out = document.getElementById("wb-traversal-output");
+    out.innerHTML = "";
+    const summary = [
+      el("b", { text: traversal.name }),
+      el("span", { text: `${traversal.structure}: ${traversal.state.length ? traversal.state.join(", ") : "empty at completion"}` }),
+      el("span", { text: `Visited nodes: ${Array.from(traversal.visited).map(id => wbNode(id).label).join(", ")}` }),
+      el("span", { text: `Traversal order: ${order.map(id => wbNode(id).label).join(" → ")}` }),
+    ];
+    if (traversal.path) {
+      summary.push(el("span", { text: `Explored nodes: ${traversal.order.map(id => wbNode(id).label).join(", ")}` }));
+      summary.push(el("span", { text: `Final path: ${traversal.path.map(id => wbNode(id).label).join(" → ")}` }));
+    }
+    out.appendChild(el("div", { class: "wb-traversal-summary" }, summary));
+  }
+
+  setStage(0);
 }
 
 function renderRail(caseId, tab, tshark) {
@@ -4744,7 +5827,7 @@ async function renderStatusBar(c) {
   const tshark = await wiresharkStatus();
   if (stamp !== _statusBarRender) return;
   bar.innerHTML = "";
-  bar.appendChild(el("span", { text: "NetForensicAI" }));
+  bar.appendChild(el("span", { text: "SAM" }));
 
   bar.appendChild(
     el("span", { class: "item" }, [

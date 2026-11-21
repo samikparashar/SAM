@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>NetForensicAI</title>
+  <meta name="color-scheme" content="dark light">
+  <title>SAM — Strategic Attack Mapper</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
@@ -28,8 +28,8 @@
           <path d="M9 12l2 2 4-4" stroke-linecap="round"/>
         </svg>
         <span class="brand-text">
-          <span class="brand-name">NetForensic<em>AI</em></span>
-          <span class="brand-sub">Local-first DFIR platform</span>
+          <span class="brand-name"><em>SAM</em></span>
+          <span class="brand-sub">Strategic Attack Mapper</span>
         </span>
       </a>
 
@@ -50,6 +50,10 @@
     <div class="main">
       <header class="topbar">
         <div id="case-switch" class="case-switch"></div>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch color theme" title="Switch color theme">
+          <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+          <span class="theme-toggle-label">Dark</span>
+        </button>
         <a class="settings-link" href="#/settings">Settings</a>
       </header>
 
